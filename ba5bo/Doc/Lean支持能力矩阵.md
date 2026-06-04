@@ -316,6 +316,542 @@ flowchart TD
 | 插件工厂 | `IBrokerageFactory` | 实盘必须 | MEF 插件发现 |
 | 历史数据 | `IBrokerage.GetHistory()` | 可选 | 历史数据下载 |
 
+### 1.7 量化交易完整业务流程中的 Lean 应用
+
+Lean 不仅是一个回测/交易引擎，更提供了覆盖量化交易**全生命周期**的工具链支持。以下展示如何在一个完整的量化策略项目中，从数据探索到策略上线运维，逐步应用 Lean 的各子系统。
+
+```mermaid
+flowchart LR
+    subgraph Phase1["1. 数据分析"]
+        A1["Research / QuantBook\nJupyter Notebook"]
+    end
+    subgraph Phase2["2. 策略编写"]
+        A2["QCAlgorithm\nC# / Python"]
+    end
+    subgraph Phase3["3. 回测验证"]
+        A3["Backtest Engine\n本地/Docker"]
+    end
+    subgraph Phase4["4. 参数优化"]
+        A4["Optimizer\n网格/步进搜索"]
+    end
+    subgraph Phase5["5. 结果分析"]
+        A5["Report Generator\nHTML / PDF"]
+    end
+    subgraph Phase6["6. 实盘部署"]
+        A6["Live Trading\nDocker + Lean CLI"]
+    end
+    subgraph Phase7["7. 运行跟踪"]
+        A7["Live ResultHandler\n实时监控 + 告警"]
+    end
+    subgraph Phase8["8. 迭代更新"]
+        A8["回测对比\n策略版本管理"]
+    end
+
+    Phase1 --> Phase2 --> Phase3 --> Phase4 --> Phase5 --> Phase6 --> Phase7 --> Phase8
+    Phase8 -.->|反馈循环| Phase1
+
+    style Phase1 fill:#e3f2fd,stroke:#1565C0,color:#000
+    style Phase2 fill:#e8f5e9,stroke:#2E7D32,color:#000
+    style Phase3 fill:#fff3e0,stroke:#E65100,color:#000
+    style Phase4 fill:#fce4ec,stroke:#C62828,color:#000
+    style Phase5 fill:#f3e5f5,stroke:#6A1B9A,color:#000
+    style Phase6 fill:#e0f2f1,stroke:#00695C,color:#000
+    style Phase7 fill:#fff8e1,stroke:#F57F17,color:#000
+    style Phase8 fill:#efebe9,stroke:#4E342E,color:#000
+```
+
+#### 1.7.1 阶段一: 数据分析与探索 (Research)
+
+Lean 提供 `QuantBook` 交互式分析环境，基于 Jupyter Notebook 实现数据探索和策略原型验证:
+
+| 能力 | 说明 | 关键文件 |
+|------|------|---------|
+| **Jupyter 集成** | Python + C# 双内核 Notebook | `Research/start.py`, `Initialize.csx` |
+| **QuantBook** | 继承 `QCAlgorithm`，在 Notebook 中使用全部引擎 API | `Research/QuantBook.cs` |
+| **历史数据请求** | `qb.history()` 自动返回 Pandas DataFrame | 通过 `PandasConverter` 转换 |
+| **指标计算** | 在 Notebook 中直接计算 SMA/EMA/RSI 等技术指标 | `QCAlgorithm.Indicators.cs` |
+| **数据可视化** | 集成 matplotlib / plotly 绘图 | `AlgorithmImports.py` 加载 matplotlib |
+| **Docker 启动** | `lean research` 一键启动 JupyterLab 容器 | `DockerfileJupyter` (端口 8888) |
+
+典型研究工作流:
+
+```python
+from AlgorithmImports import *
+
+qb = QuantBook()
+# 订阅标的
+spy = qb.add_equity("SPY")
+# 获取历史数据 (自动返回 DataFrame)
+history = qb.history("SPY", 252, Resolution.DAILY)
+# 计算技术指标
+sma = qb.sma("SPY", 20, Resolution.DAILY)
+# 可视化分析
+history['close'].plot()
+```
+
+Lean 基础镜像内置了 **50+ 个 Python 数据科学包**: pandas, numpy, scipy, scikit-learn, tensorflow, pytorch, statsmodels, matplotlib 等 (`DockerfileLeanFoundation`)。
+
+#### 1.7.2 阶段二: 策略编写 (Algorithm Development)
+
+Lean 支持 C# 和 Python 双语言策略开发，共享同一套引擎能力:
+
+| 开发方式 | 特点 | 适用场景 |
+|---------|------|---------|
+| **Python 策略** | snake_case 命名、pandas 集成、快速迭代 | 研究导向、快速原型、数据科学密集型 |
+| **C# 策略** | 强类型、编译检查、最高性能 | 生产级策略、低延迟交易、大型项目 |
+| **Alpha Framework** | 模块化架构 (Alpha → Portfolio → Risk → Execution) | 团队协作、策略组件复用 |
+
+策略核心结构:
+
+```mermaid
+flowchart TD
+    subgraph Strategy["策略代码 (QCAlgorithm)"]
+        I["initialize()\n设置标的/日期/资金/模型"]
+        OD["on_data(Slice)\n核心交易逻辑"]
+        OSC["on_securities_changed()\n标的变更处理"]
+        OE["on_order_event()\n订单跟踪"]
+    end
+
+    subgraph Framework["Alpha Framework (可选)"]
+        AM["AlphaModel\n信号生成"]
+        PCM["PortfolioConstructionModel\n仓位构建"]
+        RM["RiskManagementModel\n风险控制"]
+        EM["ExecutionModel\n执行策略"]
+    end
+
+    subgraph Data["数据层"]
+        U["Universe Selection\n动态选股"]
+        H["History Requests\n历史数据"]
+        CD["Custom Data\n另类数据"]
+    end
+
+    Strategy --> Framework
+    Strategy --> Data
+    Framework --> Data
+```
+
+#### 1.7.3 阶段三: 回测验证 (Backtesting)
+
+Lean 的回测系统通过 `config.json` 中的 `environment: "backtesting"` 配置启动:
+
+| 配置项 | 说明 | 示例值 |
+|--------|------|-------|
+| `algorithm-type-name` | 策略类名 | `"BasicTemplateAlgorithm"` |
+| `algorithm-language` | 开发语言 | `"Python"` / `"CSharp"` |
+| `algorithm-location` | 文件/DLL 路径 | `"../../../Algorithm.Python/xxx.py"` |
+| `data-folder` | 数据目录 | `"../../../Data"` |
+| `parameters` | 策略参数 | `{"lookback": "20", "threshold": "0.02"}` |
+
+**同一份策略代码**通过配置切换即可运行在回测或实盘模式，引擎自动替换底层处理器:
+
+| 处理器 | 回测模式 | 实盘模式 |
+|--------|---------|---------|
+| 数据馈送 | `FileSystemDataFeed` (读本地文件) | `LiveTradingDataFeed` (实时行情) |
+| 交易处理 | `BacktestingTransactionHandler` | `BrokerageTransactionHandler` |
+| 结果处理 | `BacktestingResultHandler` | `LiveTradingResultHandler` |
+| 定时调度 | `BacktestingRealTimeHandler` (同步) | `LiveTradingRealTimeHandler` (多线程) |
+| 经纪商 | `BacktestingBrokerage` (模拟成交) | 真实经纪商 API |
+
+运行方式:
+- **命令行**: `dotnet QuantConnect.Lean.Launcher.dll`
+- **Docker**: `lean backtest --data-provider ...`
+- **Lean CLI**: `lean backtest "MyProject"`
+
+#### 1.7.4 阶段四: 参数优化 (Optimization)
+
+Lean 内置参数优化器 (`Optimizer/`)，支持多策略参数搜索:
+
+| 优化策略 | 说明 | 文件 |
+|---------|------|------|
+| **GridSearch** | 穷举网格搜索所有参数组合 | `GridSearchOptimizationStrategy.cs` |
+| **EulerSearch** | 自适应搜索 (粗到细) | `EulerSearchOptimizationStrategy.cs` |
+| **StepBase** | 步进搜索，可配置步长 | `StepBaseOptimizationStrategy.cs` |
+
+优化流程:
+1. 在配置中定义参数范围和步长 (如 `sma_period: min=5, max=50, step=5`)
+2. 定义优化目标 (如最大化夏普比率、最小化最大回撤)
+3. 优化器并发启动多个回测进程 (`maximum-concurrent-backtests` 控制并发数)
+4. 收集所有回测结果，通过 `OptimizationAnalyzer` 生成统计摘要
+5. `OptimizationClustering` 和 `OptimizationSlicing` 提供聚类分析和参数切片视图
+
+运行方式: `lean optimize --strategy "MyProject"` 或 `dotnet QuantConnect.Optimizer.Launcher.dll`
+
+#### 1.7.5 阶段五: 结果分析与报告 (Report Generation)
+
+Lean 的 `Report/` 项目可独立生成专业级策略分析报告:
+
+```mermaid
+flowchart LR
+    subgraph Input["输入"]
+        I1["回测结果 JSON"]
+        I2["实盘结果 JSON"]
+    end
+
+    subgraph Report["Report 生成器"]
+        R1["PortfolioLooper\n重建持仓时间线"]
+        R2["30+ ReportElements\n各类分析图表"]
+        R3["template.html\n报告模板"]
+    end
+
+    subgraph Output["输出"]
+        O1["HTML 报告"]
+        O2["PDF 报告\n(wkhtmltopdf)"]
+        O3["JSON 统计\nreport-statistics.json"]
+    end
+
+    Input --> Report --> Output
+```
+
+报告涵盖 **30+ 个分析维度**:
+
+| 类别 | 具体指标 |
+|------|---------|
+| **收益分析** | 年化收益 (CAGR)、累计收益、月度/年度收益热力图、每日收益分布 |
+| **风险分析** | 最大回撤、回撤恢复时间、滚动夏普/贝塔、概率夏普比率 (PSR) |
+| **交易分析** | 收益/交易比、日均交易数、换手率、杠杆利用率 |
+| **资产配置** | 持仓时间线、资产分布、市场分布 |
+| **压力测试** | 历史危机事件分析 (15 个内置危机时期) |
+| **容量估算** | 策略容量估算 (Estimated Capacity) |
+
+运行方式:
+```bash
+dotnet QuantConnect.Report.dll \
+  --strategy-name "MyStrategy" \
+  --backtest-data-source-file backtest.json \
+  --live-data-source-file live.json \
+  --report-destination ./output/
+```
+
+#### 1.7.6 阶段六: 实盘部署 (Deployment)
+
+从回测到实盘的部署路径:
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 修改 `environment` 为实盘环境 | 如 `"live-paper"`, `"live-interactive"` |
+| 2 | 配置经纪商连接 | 填写经纪商 API 密钥、前置地址等 |
+| 3 | 配置数据源 | 选择 `DataQueueHandler` (如 IB, CTP) |
+| 4 | 设置初始资金和持仓 | `live-cash-balance`, `live-holdings` |
+| 5 | Docker 部署 | `lean live "MyProject"` |
+
+`config.json` 中预置了 **25+ 个实盘环境配置**，涵盖所有已支持的经纪商:
+
+```json
+"live-paper": {
+    "live-mode": true,
+    "setup-handler": "BrokerageSetupHandler",
+    "transaction-handler": "BacktestingTransactionHandler",  // Paper 用模拟交易
+    "data-feed-handler": "LiveTradingDataFeed",
+    "real-time-handler": "LiveTradingRealTimeHandler"
+}
+```
+
+Docker 部署架构:
+
+```mermaid
+flowchart TD
+    subgraph Docker["Docker 容器"]
+        L["Lean Launcher"]
+        DF["LiveTradingDataFeed"]
+        TH["BrokerageTransactionHandler"]
+        RH["LiveTradingResultHandler"]
+        RT["LiveTradingRealTimeHandler"]
+    end
+
+    subgraph External["外部连接"]
+        BK["经纪商 API\n(IB/CTP/Alpaca...)"]
+        DQ["数据源\n(WebSocket/TCP)"]
+        API["QuantConnect API\n(状态上报)"]
+        MSG["消息通知\n(Email/Webhook)"]
+    end
+
+    L --> DF & TH & RH & RT
+    DF --> DQ
+    TH --> BK
+    RH --> API & MSG
+    RT --> BK
+```
+
+#### 1.7.7 阶段七: 运行跟踪与监控 (Live Monitoring)
+
+实盘运行期间，`LiveTradingResultHandler` 提供:
+
+| 监控能力 | 机制 | 频率 |
+|---------|------|------|
+| **权益曲线** | 定时采样 Equity / Holdings / P&L | 实时 |
+| **订单跟踪** | 每笔订单状态变更推送 | 实时 |
+| **运行时统计** | 胜率、盈亏比、持仓时间等 | 持续更新 |
+| **状态上报** | `Api` 组件向 QuantConnect Cloud 上报算法状态 | 周期性 |
+| **消息通知** | `Messaging` 组件发送 Email / Webhook 告警 | 事件触发 |
+| **经纪商消息** | `OnBrokerageMessage()` / `OnBrokerageDisconnect()` 回调 | 事件触发 |
+| **保证金预警** | `OnMarginCall()` / `OnMarginCallWarning()` 回调 | 每5分钟 |
+
+策略中可注册自定义监控:
+
+```python
+def initialize(self):
+    # 注册自定义图表
+    self.add_chart(Chart("Custom Metrics"))
+    # 定时发送状态报告
+    self.schedule.on("daily-report",
+        self.date_rules.every_day(),
+        self.time_rules.at(16, 0),
+        self.send_daily_report)
+
+def send_daily_report(self):
+    self.debug(f"Portfolio: {self.portfolio.total_portfolio_value}")
+```
+
+#### 1.7.8 阶段八: 迭代更新 (Iteration)
+
+策略上线后的持续迭代闭环:
+
+```mermaid
+flowchart TD
+    subgraph Compare["对比分析"]
+        C1["Report 对比:\n回测 vs 实盘\n收益/风险偏差"]
+        C2["PortfolioLooper:\n逐笔持仓对比"]
+    end
+
+    subgraph Diagnose["问题诊断"]
+        D1["滑点分析:\n实盘 vs 回测成交差异"]
+        D2["延迟分析:\n信号到成交的时延"]
+        D3["费用核对:\n实际费用 vs 模型费用"]
+    end
+
+    subgraph Iterate["策略迭代"]
+        I1["调整参数 → 重新优化"]
+        I2["优化 Fill/Slippage 模型"]
+        I3["更新 Universe 规则"]
+        I4["添加新的 Alpha 信号"]
+    end
+
+    Compare --> Diagnose --> Iterate --> |重新回测| Compare
+```
+
+Lean 支持的关键迭代能力:
+
+| 能力 | 说明 |
+|------|------|
+| **回测-实盘对比** | Report 项目同时接收回测和实盘 JSON，生成对比报告 |
+| **样本外验证** | Optimizer 支持 out-of-sample 参数 (`out-of-sample-days`) |
+| **参数热更新** | `config.json` 的 `parameters` 字段可快速切换策略参数 |
+| **模型可替换** | 同一策略可替换 FillModel / SlippageModel / FeeModel 以更贴近实际 |
+| **Git 版本管理** | 策略代码 + 配置 + 数据全部文件化，适合 Git 管理 |
+| **Docker 镜像固化** | 每次构建的 Docker 镜像可标记版本，确保环境一致性 |
+
+#### 1.7.9 完整工具链总结
+
+| 阶段 | Lean 工具 | 入口命令 |
+|------|----------|---------|
+| 数据分析 | Research / QuantBook / JupyterLab | `lean research` |
+| 策略编写 | QCAlgorithm (C# / Python) | IDE / VS Code (.devcontainer) |
+| 数据获取 | ToolBox / DownloaderDataProvider | `dotnet ToolBox.dll` / `DownloaderDataProvider.dll` |
+| 回测验证 | Engine + BacktestResultHandler | `lean backtest` |
+| 参数优化 | Optimizer (Grid/Euler/Step) | `lean optimize` |
+| 报告生成 | Report (HTML/PDF/JSON) | `dotnet Report.dll` |
+| 实盘部署 | Engine + LiveResultHandler + Docker | `lean live` |
+| 运行监控 | LiveResultHandler + Messaging + Api | 引擎内置 |
+| 迭代对比 | Report (backtest vs live) + Optimizer | 同上 |
+
+### 1.8 Python 算法编写支持体系
+
+Lean 引擎通过 **PythonNet** 实现了 C# 与 Python 的双语言支持，使 Python 算法可以完全复用 C# 引擎的全部功能。
+
+#### 1.8.1 Python 运行时集成架构
+
+```mermaid
+flowchart TD
+    subgraph Config["配置层"]
+        C1["Launcher/config.json\nalgorithm-language: Python\nalgorithm-location: *.py"]
+    end
+
+    subgraph Loader["加载层"]
+        L1["Loader.TryCreatePythonAlgorithm()"]
+        --> L2["PythonInitializer.Initialize()\n(PythonNet 嵌入解释器)"]
+        --> L3["Py.Import(moduleName)\n导入 Python 模块"]
+        --> L4["查找 QCAlgorithm 子类\n创建 AlgorithmPythonWrapper"]
+    end
+
+    subgraph Bridge["桥接层"]
+        B1["BasePythonWrapper&lt;T&gt;\nC#-Python 双向调用"]
+        B2["方法缓存 (_pythonMethods)\nsnake_case ↔ PascalCase"]
+        B3["GIL 管理 (Py.GIL)\n线程安全"]
+    end
+
+    subgraph Runtime["运行时"]
+        R1["AlgorithmManager.Run()\n(C# 主循环)"]
+        --> R2["OnData(Slice)\n→ Python on_data()"]
+        --> R3["Python 下单\n→ C# TransactionHandler"]
+    end
+
+    Config --> Loader --> Bridge --> Runtime
+```
+
+关键依赖: `QuantConnect.pythonnet 2.0.54` (QuantConnect 维护的 pythonnet 分支，增加了 `System.Decimal` 和 `System.DateTime` 支持)。
+
+#### 1.8.2 Python 模块体系
+
+`AlgorithmImports.py` 是 Python 算法的统一入口模块，负责:
+
+| 加载内容 | 说明 |
+|---------|------|
+| `QuantConnect.*.dll` 全部程序集 | 通过 `clr.AddReference()` 加载所有 C# 程序集 |
+| `QuantConnect.Algorithm` | QCAlgorithm 基类 + 所有算法接口 |
+| `QuantConnect.Data.*` | 数据类型 (TradeBar, QuoteBar, Tick, Slice...) |
+| `QuantConnect.Orders` | 订单类型和下单方法 |
+| `QuantConnect.Indicators` | 技术指标库 (SMA, EMA, RSI, MACD, BollingerBands...) |
+| `QuantConnect.Securities` | 证券类型和属性模型 |
+| `QuantConnect.Algorithm.Framework.*` | Alpha / Portfolio / Risk / Execution 模型 |
+| `numpy`, `pandas`, `matplotlib` | 可选的数据科学工具库 |
+| `datetime`, `typing`, `math`, `json` | Python 标准库 |
+
+Python 算法标准模板:
+
+```python
+from AlgorithmImports import *
+
+class MyAlgorithm(QCAlgorithm):
+    def initialize(self):
+        self.set_start_date(2020, 1, 1)
+        self.set_end_date(2024, 12, 31)
+        self.set_cash(100000)
+        self.add_equity("SPY", Resolution.MINUTE)
+        # 添加技术指标
+        self.sma = self.sma("SPY", 20, Resolution.DAILY)
+
+    def on_data(self, data: Slice):
+        if not self.portfolio.invested and self.sma.is_ready:
+            self.set_holdings("SPY", 1)
+
+    def on_securities_changed(self, changes):
+        for security in changes.added_securities:
+            self.debug(f"Added: {security.symbol}")
+```
+
+#### 1.8.3 C#-Python 桥接包装器体系
+
+Lean 为 **30+ 个 C# 接口**提供了 Python 包装器，使 Python 类可以直接实现这些接口:
+
+| 类别 | 包装器类 | 对应接口 |
+|------|---------|---------|
+| **算法核心** | `AlgorithmPythonWrapper` | `IAlgorithm` |
+| **费用模型** | `FeeModelPythonWrapper` | `IFeeModel` |
+| **成交模型** | `FillModelPythonWrapper` | `IFillModel` |
+| **滑点模型** | `SlippageModelPythonWrapper` | `ISlippageModel` |
+| **保证金模型** | `BuyingPowerModelPythonWrapper` | `IBuyingPowerModel` |
+| **波动率模型** | `VolatilityModelPythonWrapper` | `IVolatilityModel` |
+| **结算模型** | `SettlementModelPythonWrapper` | `ISettlementModel` |
+| **聚合器** | `DataConsolidatorPythonWrapper` | `IDataConsolidator` |
+| **期权定价** | `OptionPriceModelPythonWrapper` | `IOptionPriceModel` |
+| **经纪商模型** | `BrokerageModelPythonWrapper` | `IBrokerageModel` |
+| **基准** | `BenchmarkPythonWrapper` | `IBenchmark` |
+| **Alpha 模型** | `AlphaModelPythonWrapper` | `IAlphaModel` |
+| **执行模型** | `ExecutionModelPythonWrapper` | `IExecutionModel` |
+| **组合构建** | `PortfolioConstructionModelPythonWrapper` | `IPortfolioConstructionModel` |
+| **风险管理** | `RiskManagementModelPythonWrapper` | `IRiskManagementModel` |
+
+桥接层的关键设计:
+
+- **命名约定双映射**: 自动将 Python 的 `snake_case` 映射到 C# 的 `PascalCase`，如 `on_data` → `OnData`
+- **方法缓存**: `_pythonMethods` 字典缓存已解析的 Python 方法引用，避免每次调用时重复查找
+- **GIL 安全**: 所有 C# → Python 调用均在 `using (Py.GIL())` 块中执行，确保线程安全
+- **类型转换**: `PythonRuntimeChecker` 提供 C# ↔ Python 的类型安全转换和错误诊断
+
+#### 1.8.4 Framework 模型 Python 支持
+
+Lean 的 Alpha 框架 (Alpha Model Framework) 完全支持 Python 实现:
+
+```python
+class MyAlphaModel(AlphaModel):
+    def update(self, algorithm, data):
+        insights = []
+        # 生成交易信号
+        insights.append(
+            Insight.price("SPY", timedelta(days=1), InsightDirection.UP)
+        )
+        return insights
+
+    def on_securities_changed(self, algorithm, changes):
+        # 处理标的变更
+        pass
+
+# 在算法中使用
+class FrameworkAlgorithm(QCAlgorithm):
+    def initialize(self):
+        self.set_alpha(MyAlphaModel())
+        self.set_portfolio_construction(EqualWeightingPortfolioConstructionModel())
+        self.set_execution(ImmediateExecutionModel())
+        self.set_risk_management(MaximumDrawdownPercentPerSecurity(0.01))
+```
+
+#### 1.8.5 数据科学与 Pandas 集成
+
+Lean 内置了 Pandas 数据转换支持:
+
+| 功能 | 实现方式 | 说明 |
+|------|---------|------|
+| **历史数据 → DataFrame** | `PandasConverter` | `self.history("SPY", 100, Resolution.DAILY)` 自动返回 DataFrame |
+| **Slice → DataFrame** | `PandasConverter` | 可将当前切片数据转为 DataFrame 进行分析 |
+| **自定义指标** | `PythonIndicator` | 用 Python 实现自定义技术指标 |
+| **NumPy 混合运算** | 直接调用 | Python `np.sin()` 与 C# `Math.Sin()` 可混合使用 |
+| **自定义数据** | `PythonData` | 用纯 Python 定义新的数据类型 (Reader/GetSource) |
+
+自定义数据示例:
+
+```python
+class Bitcoin(PythonData):
+    def get_source(self, config, date, is_live_mode):
+        return SubscriptionDataSource("https://api.example.com/btc")
+
+    def reader(self, config, line, date, is_live_mode):
+        coin = Bitcoin()
+        coin.symbol = config.symbol
+        data = json.loads(line)
+        coin.end_time = date + timedelta(days=1)
+        coin.value = data["price"]
+        return coin
+```
+
+#### 1.8.6 Python 环境与包管理
+
+| 配置项 | 说明 |
+|--------|------|
+| Python 版本 | 3.11 (推荐 3.11.11) |
+| 必要包 | `pandas==2.2.3`, `wrapt==1.16.0` |
+| 虚拟环境 | 通过 `config.json` 的 `python-venv` 键配置 |
+| DLL 路径 | 环境变量 `PYTHONNET_PYDLL` 指向 `python311.dll` |
+| 自动补全 | `pip install quantconnect-stubs` 提供 IDE 代码提示 |
+| Conda 支持 | `conda create -n qc_lean python=3.11.11 pandas=2.2.3 wrapt=1.16.0` |
+
+Python 虚拟环境激活流程 (`PythonInitializer.ActivatePythonVirtualEnvironment()`):
+1. 读取 `pyvenv.cfg` 检查 `include-system-site-packages`
+2. 设置 `sys.prefix` 和 `sys.exec_prefix` 为虚拟环境路径
+3. 调用 `site.main()` 重新初始化站点包
+4. 根据配置决定是否移除系统站点包
+
+#### 1.8.7 Python 可覆写的全部事件回调
+
+| C# 方法 | Python 方法名 | 触发时机 |
+|---------|-------------|---------|
+| `Initialize()` | `initialize` | 算法初始化 |
+| `OnData(Slice)` | `on_data` | 每个有数据的时间片 |
+| `OnSecuritiesChanged()` | `on_securities_changed` | Universe 标的变更 |
+| `OnOrderEvent()` | `on_order_event` | 订单状态变化 |
+| `OnEndOfDay()` | `on_end_of_day` | 交易日结束 |
+| `OnEndOfAlgorithm()` | `on_end_of_algorithm` | 算法运行结束 |
+| `OnMarginCall()` | `on_margin_call` | 保证金预警 |
+| `OnBrokerageDisconnect()` | `on_brokerage_disconnect` | 经纪商断连 |
+| `OnBrokerageReconnect()` | `on_brokerage_reconnect` | 经纪商重连 |
+| `OnBrokerageMessage()` | `on_brokerage_message` | 经纪商消息 |
+| `OnSplits()` | `on_splits` | 股票拆分 |
+| `OnDividends()` | `on_dividends` | 分红事件 |
+| `OnDelistings()` | `on_delistings` | 退市事件 |
+| `OnSymbolChangedEvents()` | `on_symbol_changed_events` | Symbol 变更 |
+| `OnAssignmentOrderEvent()` | `on_assignment_order_event` | 期权行权 |
+| `OnWarmupFinished()` | `on_warmup_finished` | 预热完成 |
+| `OnCommand(dynamic)` | `on_command` | 自定义命令 |
+
 ---
 
 ## 2. 中国内地市场支持总览
